@@ -1,0 +1,48 @@
+// hardhat.config.js (ESM)
+import "dotenv/config";
+import "@nomicfoundation/hardhat-toolbox";   // <-- includes the ethers plugin internally
+import "@openzeppelin/hardhat-upgrades";
+/**
+ * run hardhat node with existing users: 
+ npx hardhat node \
+  --fork https://polygon-amoy.g.alchemy.com/v2/rJNzyTUoG75bsNITFKIw4d6uIHIuGWS2 \
+  --fork-block-number 21400000
+ */
+
+module.exports = {
+  solidity: {
+    version: "0.8.25",
+    settings: {
+      optimizer: { enabled: true, runs: 200 },
+      viaIR: true           // 👈 enable the new IR compiler
+    }
+  },
+  mocha: {
+    timeout: 120000,
+  },
+  paths: {
+    sources: "./contracts",
+    artifacts: "./artifacts",
+    cache: "./cache",
+    tests: "./test",
+  },
+  networks: {
+    amoy: {
+      url:  "https://polygon-amoy.g.alchemy.com/v2/rJNzyTUoG75bsNITFKIw4d6uIHIuGWS2", // or another RPC endpoint
+      chainId: 80002,
+      accounts: [
+        process.env.MASTER_PRIVATE_KEY,        // 0
+        process.env.UNIONLEADER_PRIVATE_KEY,   // 1
+        process.env.INVESTOR_PRIVATE_KEY       // 2
+      ]
+    },
+    localhost: {
+        url: "http://127.0.0.1:8545",   // default
+        accounts: [
+          process.env.MASTER_PRIVATE_KEY,        // 0
+          process.env.UNIONLEADER_PRIVATE_KEY,   // 1
+          process.env.INVESTOR_PRIVATE_KEY       // 2
+        ]
+      },
+  }
+};

@@ -1,0 +1,312 @@
+const { expect } = require("chai");
+const { ethers, network } = require("hardhat");
+const {
+  parseEther,
+  hexlify,
+  toUtf8Bytes,
+  keccak256,
+  randomBytes,
+  ZeroAddress,
+  ZeroHash,
+} = require("ethers");
+
+const toWei = (n) => parseEther(n.toString());
+const now = async () => (await ethers.provider.getBlock("latest")).timestamp;
+const RAYn = 10n ** 27n;
+const MIN_UNBONDING_S = 14 * 24 * 60 * 60;
+
+async function increaseTime(seconds) {
+  await network.provider.send("evm_increaseTime", [Number(seconds)]);
+  await network.provider.send("evm_mine");
+}
+
+async function logCodeSize(label, addr) {
+  const code = await ethers.provider.getCode(addr); // hex string "0x..."
+  const sizeBytes = (code.length - 2) / 2;          // 2 hex chars per byte
+  console.log(`${label} code size: ${sizeBytes} bytes (${(sizeBytes/1024).toFixed(2)} KB)`);
+  return sizeBytes;
+}
+
+describe("GenericFundUpgradeable — Core-only flow", function () {
+  let fund, erc20;
+  let owner, treasury, borrower1, borrower2, junior1, junior2, senior1, senior2, rand;
+  let unionA;
+  const loanTypeA = keccak256(toUtf8Bytes("PLANTING"));
+
+  before(async () => {
+    [owner, treasury, borrower1, borrower2, junior1, junior2, senior1, senior2, rand] =
+      await ethers.getSigners();
+
+    // Mock token
+    const ERC20F = await ethers.getContractFactory("MockERC20");
+    erc20 = await ERC20F.connect(owner).deploy("MockUSD", "mUSD", 18);
+    await erc20.waitForDeployment();
+
+    // Lib
+    const MathLibF = await ethers.getContractFactory("GenericFundMathLib");
+    const mathLib = await MathLibF.connect(owner).deploy();
+    await mathLib.waitForDeployment();
+    const mathLibAddress = await mathLib.getAddress();
+
+    // Core
+    const FundF = await ethers.getContractFactory("GenericFundUpgradeable_V2");
+    fund = await FundF.connect(owner).deploy();
+    await fund.waitForDeployment();
+    await logCodeSize("GenericFundUpgradeable", await fund.getAddress());
+
+    // init: treasury + roles (roles not used; owner passes leader/oracle checks)
+    await (await fund.connect(owner).initialize(await treasury.getAddress(), ZeroAddress)).wait();
+
+    // handy union
+    unionA = ethers.Wallet.createRandom().address;
+
+    // seed balances & approvals
+    const seed = async (s, amount) => {
+      await (await erc20.connect(owner).mint(await s.getAddress(), amount)).wait();
+      await (await erc20.connect(s).approve(await fund.getAddress(), ethers.MaxUint256)).wait();
+    };
+    await seed(junior1, toWei(50_000));
+    await seed(junior2, toWei(10_000));
+    await seed(senior1, toWei(50_000));
+    await seed(senior2, toWei(10_000));
+    await seed(borrower1, toWei(1_000));
+    await seed(borrower2, toWei(1_000));
+  });
+
+  it("A1: junior ERC20 deposit earmarked by loanType", async () => {
+    const token = await erc20.getAddress();
+    const amt = toWei(3_000);
+
+    await expect(
+      fund.connect(junior1).depositJunior(unionA, token, loanTypeA, amt)
+    ).to.emit(fund, "Deposit");
+
+    const m = await fund.getJuniorMarket(unionA, token, loanTypeA);
+    expect(m.cash).to.equal(amt);
+    expect(m.index).to.equal(RAYn);
+    expect(m.totalShares).to.be.gt(0n);
+  });
+
+  it("A2: senior ERC20 deposit", async () => {
+    const token = await erc20.getAddress();
+    const amt = toWei(5_000);
+
+    await expect(fund.connect(senior1).depositSenior(token, amt)).to.emit(fund, "Deposit");
+
+    const s = await fund.getSeniorMarket(token);
+    expect(s.cash).to.equal(amt);
+    expect(s.index).to.equal(RAYn);
+    expect(s.totalShares).to.be.gt(0n);
+  });
+
+  it("B1: fund → borrower claims; waterfall pulls junior then senior", async () => {
+    const token = await erc20.getAddress();
+
+    // allow large borrowing (cap is 2 × (juniorMaxSum + seniorCap))
+    await (await fund.connect(owner).setSeniorCap(unionA, token, toWei(1_000_000))).wait();
+
+    // balances before
+    const jBefore = await fund.getJuniorMarket(unionA, token, loanTypeA);
+    const sBefore = await fund.getSeniorMarket(token);
+
+    // owner acts as oracle/leader for simplicity
+    const loanId = keccak256(randomBytes(32));
+    const amount = toWei(800);
+    const rateBP = 1000; // 10% APR
+    const mat = (await now()) + 30 * 24 * 60 * 60;
+
+    await expect(
+      fund.connect(owner).fundLoan(unionA, loanId, token, await borrower1.getAddress(), loanTypeA, amount, rateBP, mat)
+    ).to.emit(fund, "LoanFunded");
+
+    // junior first
+    const jAfter = await fund.getJuniorMarket(unionA, token, loanTypeA);
+    const sAfter = await fund.getSeniorMarket(token);
+    expect(jAfter.cash).to.equal(jBefore.cash - amount); // all from junior; enough cash
+    expect(sAfter.cash).to.equal(sBefore.cash);
+
+    const balBefore = await erc20.balanceOf(await borrower1.getAddress());
+    await expect(fund.connect(borrower1).claimLoan(unionA, loanId)).to.emit(fund, "LoanClaimed");
+    const balAfter = await erc20.balanceOf(await borrower1.getAddress());
+    expect(balAfter - balBefore).to.equal(amount);
+  });
+
+  it("C1: interest repay bumps both indices and pays treasury", async () => {
+    const token = await erc20.getAddress();
+    const treasuryAddr = await fund.treasury();
+
+    // find last loanId we used (we kept it in the previous block's scope)
+    // we regenerate same loanId deterministically for this block
+    // (alternatively stash loanId in a higher scope)
+    const loanId = await (async () => {
+      // In the previous test we used a random id; instead, create one more small loan here to have a local id.
+      const id = keccak256(randomBytes(32));
+      await fund
+        .connect(owner)
+        .fundLoan(unionA, id, token, await borrower1.getAddress(), loanTypeA, toWei(200), 1200, (await now()) + 10);
+      await fund.connect(borrower1).claimLoan(unionA, id);
+      return id;
+    })();
+
+    const j0 = await fund.getJuniorMarket(unionA, token, loanTypeA);
+    const s0 = await fund.getSeniorMarket(token);
+    const tre0 = await erc20.balanceOf(treasuryAddr);
+
+    await increaseTime(10 * 24 * 60 * 60);
+    await expect(fund.connect(borrower1).repayLoan(unionA, loanId, toWei(50))).to.emit(fund, "LoanRepaid");
+
+    const j1 = await fund.getJuniorMarket(unionA, token, loanTypeA);
+    const s1 = await fund.getSeniorMarket(token);
+    const tre1 = await erc20.balanceOf(treasuryAddr);
+
+    expect(j1.index).to.be.gt(j0.index);
+    expect(s1.index).to.be.gt(s0.index);
+    expect(tre1).to.be.gte(tre0);
+  });
+
+  it("C2: request → promote → claim (senior)", async () => {
+    const token = await erc20.getAddress();
+
+    // pick half the shares
+    const inv = await fund.getInvestorSenior(token, await senior1.getAddress());
+    const half = inv.shares / 2n;
+    if (half === 0n) this.skip();
+
+    // request
+    await expect(fund.connect(senior1).requestUnbondSenior(token, half)).to.emit(fund, "UnbondRequested");
+
+    // no promotion yet
+    await fund.connect(owner).promoteSenior(token, [await senior1.getAddress()]);
+    let invMid = await fund.getInvestorSenior(token, await senior1.getAddress());
+    expect(invMid.pending).to.equal(half);
+
+    // mature and promote
+    await increaseTime(MIN_UNBONDING_S + 2);
+    await fund.connect(owner).promoteSenior(token, [await senior1.getAddress()]);
+    invMid = await fund.getInvestorSenior(token, await senior1.getAddress());
+    expect(invMid.pending).to.equal(0n);
+    expect(invMid.locked).to.be.gt(0n); // claimable>0
+
+    // claim (all)
+    await expect(fund.connect(senior1).claimSenior(token, 0)).to.emit(fund, "Claimed");
+
+    const after = await fund.getInvestorSenior(token, await senior1.getAddress());
+    expect(after.locked).to.equal(0n);
+  });
+
+  it("C3: request → promote → claim (junior)", async () => {
+    const token = await erc20.getAddress();
+
+    const inv = await fund.getInvestorJunior(unionA, token, loanTypeA, await junior1.getAddress());
+    const part = inv.shares / 3n;
+    if (part === 0n) this.skip();
+
+    await expect(
+      fund.connect(junior1).requestUnbondJunior(unionA, token, loanTypeA, part)
+    ).to.emit(fund, "UnbondRequested");
+
+    await increaseTime(MIN_UNBONDING_S + 1);
+    await fund.connect(owner).promoteJunior(unionA, token, loanTypeA, [await junior1.getAddress()]);
+
+    await expect(fund.connect(junior1).claimJunior(unionA, token, loanTypeA, 0)).to.emit(fund, "Claimed");
+  });
+
+  it("D1: rollover (same borrower) requires interest within tolerance", async () => {
+    const token = await erc20.getAddress();
+
+    // create fresh loan to control timing
+    const loanId = keccak256(randomBytes(32));
+    await fund
+      .connect(owner)
+      .fundLoan(unionA, loanId, token, await borrower1.getAddress(), loanTypeA, toWei(300), 1000, (await now()) + 40);
+    await fund.connect(borrower1).claimLoan(unionA, loanId);
+
+    // accrue a bit, then settle (<= tol)
+    await increaseTime(24 * 60 * 60);
+    await fund.connect(borrower1).repayLoan(unionA, loanId, toWei(1)); // mostly interest
+
+    const newRate = 900;
+    const newMat = (await now()) + 45 * 24 * 60 * 60;
+    await expect(
+      fund.connect(owner).transferLoan(unionA, loanId, await borrower1.getAddress(), newRate, newMat)
+    ).to.emit(fund, "LoanTransferred");
+  });
+
+  it("D2: transfer to new borrower after settling interest", async () => {
+    const token = await erc20.getAddress();
+
+    const loanId = keccak256(randomBytes(32));
+    await fund
+      .connect(owner)
+      .fundLoan(unionA, loanId, token, await borrower1.getAddress(), loanTypeA, toWei(120), 950, (await now()) + 20);
+    await fund.connect(borrower1).claimLoan(unionA, loanId);
+
+    // settle interest enough to be within 3-day tolerance
+    await increaseTime(2 * 24 * 60 * 60);
+    await fund.connect(borrower1).repayLoan(unionA, loanId, toWei(0.5));
+
+    await expect(
+      fund.connect(owner).transferLoan(unionA, loanId, await borrower2.getAddress(), 1100, (await now()) + 30 * 24 * 60 * 60)
+    ).to.emit(fund, "LoanTransferred");
+  });
+
+  it("E1: Reserve buffer blocks oversized funding while claimables exist", async () => {
+    const token = await erc20.getAddress();
+
+    // Turn on a cushion: 10% safety, no floor, hardStop=true (not required for block, but realistic)
+    await (await fund.connect(owner).setReserveConfig(token, 1000 /* 10% */, 0, true)).wait();
+
+    // Make a new senior unbond request to create claimable reserve pressure
+    const invS = await fund.getInvestorSenior(token, await senior2.getAddress());
+    if (invS.shares > 0n) {
+      const ask = invS.shares / 4n || 1n;
+      await (await fund.connect(senior2).requestUnbondSenior(token, ask)).wait();
+    }
+
+    // Pending claimables increase requiredReserve; try a big loan to trip the check
+    const loanId = keccak256(randomBytes(32));
+    const big = toWei(1_000_000);
+
+    await expect(
+      fund
+        .connect(owner)
+        .fundLoan(unionA, loanId, token, await borrower2.getAddress(), loanTypeA, big, 800, (await now()) + 10)
+    ).to.be.revertedWith("insufficient reserve");
+
+    // Promote + claim to release reserve, then borrow a smaller safe amount
+    await increaseTime(MIN_UNBONDING_S + 1);
+    await fund.connect(owner).promoteSenior(token, [await senior2.getAddress()]);
+    await fund.connect(senior2).claimSenior(token, 0);
+
+    const okAmt = toWei(10);
+    const loanId2 = keccak256(randomBytes(32));
+    await expect(
+      fund
+        .connect(owner)
+        .fundLoan(unionA, loanId2, token, await borrower2.getAddress(), loanTypeA, okAmt, 800, (await now()) + 10)
+    ).to.emit(fund, "LoanFunded");
+  });
+
+  it("F1: default and finalize liquidation sends recovered to junior cash", async () => {
+    const token = await erc20.getAddress();
+
+    const loanId = keccak256(randomBytes(32));
+    await fund
+      .connect(owner)
+      .fundLoan(unionA, loanId, token, await borrower2.getAddress(), loanTypeA, toWei(90), 700, (await now()) + 15);
+    await fund.connect(borrower2).claimLoan(unionA, loanId);
+
+    const j0 = await fund.getJuniorMarket(unionA, token, loanTypeA);
+
+    await expect(fund.connect(owner).markDefault(unionA, loanId)).to.emit(fund, "LoanDefaulted");
+
+    // Recover some and finalize
+    await expect(fund.connect(owner).finalizeLiquidation(unionA, loanId, toWei(20))).to.emit(
+      fund,
+      "LoanLiquidated"
+    );
+
+    const j1 = await fund.getJuniorMarket(unionA, token, loanTypeA);
+    expect(j1.cash).to.equal(j0.cash + toWei(20));
+  });
+});

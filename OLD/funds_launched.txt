@@ -1,0 +1,9 @@
+
+// 1
+Factory logic deployed at: 0x152CFb6742a3c2429D40990d3373b279272C7C3f
+Factory proxy deployed at: 0x71d209d37D6Bb4F7579769981F206De083cB25D5
+📝 createInputFund tx hash: 0x2ea1f84bb52f89457967ff789de1af07b627d16a1ff2cb56c3d5a8178b9d9b39
+🏦 New fund proxy address: 0xdD2154F0204c1a09fA84e4c9502c09e91eee3538
+👤 Belongs to union: 0xC7FdEf69986317c1770d46C850560D9e469849Cf
+📖 Fund type/name: InputFund
+

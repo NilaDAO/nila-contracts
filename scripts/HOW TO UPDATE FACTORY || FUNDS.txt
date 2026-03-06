@@ -1,0 +1,119 @@
+# Nila DAO – Factory & Fund Upgrade Playbook
+
+#####
+
+TLDR: - (selfwritten) 
+
+Simple update the factory, call updateFactory (see in script) (SEE 1)
+
+To update a fund, the factory needs to have the new fundlogic for a fund type, so we need to run the callSetFundLogic first, 
+the function is called in updateFactory, but i run it individually, with the new INPUT impl provided. 
+
+We can then run deployFund again to be able to add new funds. 
+
+We run upgradeFund to update a specific (already deployed) fund to the new specifications.
+
+#####
+
+## 0. Prerequisites
+
+* **Hardhat plugins:** `@openzeppelin/hardhat‑upgrades`, `@nomicfoundation/hardhat‑ethers`
+* **Env vars** in `.env` (all 0x‑addresses, no quotes):
+
+  ```bash
+  PRIVATE_KEY=<factory‑owner>
+  NILA_ADDRESS=<ERC20>
+  USDC_ADDRESS=<ERC20>
+  ORACLE_SIGNER=<oracle EOA>
+  UNION_ADDRESS=<union owner>
+  ```
+* **Network config** (`hardhat.config.js`): add the Amoy RPC and put the owner key first in `accounts`.
+
+---
+
+## 1. Upgrade **FundFactoryUpgradeable**
+
+1. `npx hardhat compile --force` ─ ensure fresh build.
+2. *Optional* – make code changes in `FundFactoryUpgradeable.sol`.
+3. Run `scripts/handleFundFactory/upgradeFactory.js`:
+
+   ```bash
+   npx hardhat run scripts/handleFundFactory/upgradeFactory.js --network amoy
+   ```
+
+   * Deploys new factory impl.
+   * Deploys fresh **InputFundUpgradeable** impl.
+   * Calls `setFundLogic("INPUT", impl)` **inside the same run**.
+   * Console prints:
+
+     ```text
+     proxy address : 0x…
+     new factory impl : 0x…
+     INPUT impl registered : 0x…
+     ```
+
+> **Gotcha:** If you skip `setFundLogic`, later fund creation will revert with `ERC1967InvalidImplementation`.
+
+---
+
+## 2. Deploy a new **InputFundUpgradeable** implementation only (no factory upgrade)
+
+1. `npx hardhat run scripts/handleFunds/deployFund.js --network amoy`
+   – prints `impl: 0xAbC…`.
+2. Register it:
+
+   ```bash
+   npx hardhat console --network amoy
+   > const f = await ethers.getContractAt("FundFactoryUpgradeable", "0x<factoryProxy>")
+   > await f.setFundLogic(ethers.id("INPUT"), "0xAbC…")
+   ```
+---
+
+## 3. User – Create a new fund
+
+```bash
+npx hardhat run scripts/handleFunds/deployFund.js --network amoy
+```
+
+* Script calls `createInputFund` with params:
+  `tokenList, fundName, "INPUT", oracleSigner, baseRateBP, unionOwner`.
+* Factory:
+
+  1. Looks up `fundLogic[keccak256("INPUT")]`.
+  2. Deploys `ERC1967Proxy(impl, initData)`.
+  3. Emits `FundCreated(unionAddr, proxyAddr, "INPUT")`.
+* Console shows new fund proxy address.
+
+---
+
+## 4. Troubleshooting Cheatsheet
+
+| Symptom                          | Likely cause                                    | Fix                                                                            |
+| -------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------ |
+| `ERC1967InvalidImplementation`   | `setFundLogic` not called or wrong address      | Register correct impl address                                                  |
+| `OwnableUnauthorizedAccount`     | Caller isn’t factory owner (for `setFundLogic`) | Run tx from owner key                                                          |
+| `FailedCall / initialize revert` | Param order mismatch or empty token list        | Ensure factory encodes args as `_fundName,_fundType,_tokens,…` & pass ≥1 token |
+
+---
+
+## 5. Flow Diagram (text)
+
+```
+Admin          Factory                Chain
+ │              │                      │
+ │  upgradeProxy│                      │
+ │──────────────▶ deploy new impl      │
+ │              │                      │
+ │  setFundLogic("INPUT", impl)        │
+ │──────────────▶ mapping updated      │
+ │              │                      │
+User            │                      │
+ │  createInputFund(args)              │
+ │──────────────▶ deploy ERC1967 proxy │
+ │              │───init(…)───────────▶│
+ │              │◀──proxy addr──────── │
+```
+
+---
+
+*Updated May 7 2025*

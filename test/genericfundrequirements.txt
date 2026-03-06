@@ -1,0 +1,54 @@
+Requirements; 
+
+General: 
+
+The fund has a single pool, but tracks per union, a set if funds, 
+
+- Each union has a name (string)
+- Each union has < 15 fund types (string)
+- Each union has rate params
+- Each union has buffer params
+
+Investors: 
+
+- Each Investor has shares priced as amount * underlying value (nin, usdc)
+- Junior investors shares are priced as value of erc20 + erc1155 tokens. 
+- Senior investors shares are priced as value of erc20 tokens. 
+
+
+- Investor have two types, junior and senior
+    - junior have a land title (erc721 token) and can also borrow
+    - seniors have no land title (erc721 token) in balance, and are not able to borrow
+
+- Investors can always claim pending interest instantly ( = pool reserve minimum)
+- Investors can withdraw funds, with a minimal unbonding period as max( minimum period, period to repay of sufficient liquidity)
+    - repay suf. liq : withdraw amnt < sum borrowed funds market with reportMaturity at timestamp x. 
+
+- Senior investors deposit ERC20 tokens to a union 
+
+- Junior investors deposit ERC20 or ERC1155 tokens (food tokens) to a union and a fund type
+
+Borrowers: 
+
+- Borrowers can get a loan from the pool, if they can show a voucher signed by the oracle (claimLoan)
+- Borrowers experience a 'hockeystick' rate progress, where only at near pool depletion, rates quickly rise to max set in setRateParams
+- Borrowers can pay back loan at all time as : principal + days * APY
+- Borrowers default on their loan, when oracle called reportMaturity of timestamp maturity + 41 days (6 weeks)
+    default action = reduce Junior shares: total junior investment - defaultAmount, if amount is larger, reduce senior shares
+
+Unionleaders: 
+
+- Union leader can roll-over or transfer loan. 
+    roll-over: has voucher, borrowers pays interest, loan is rolled-over. 
+    transfered: new borrower has voucher, old borrower paid interest, loan is transfered. 
+
+- Union leaders can set:
+    - rate params; loan parameters
+    - buffer params: cash buffers 
+    - create fund types 
+    - remove fund types
+    - (de)activate the union
+        - activate set mapping
+        - deactivate, remove mapping + return funds to all investors (requirement = no pending loans)
+    
+     

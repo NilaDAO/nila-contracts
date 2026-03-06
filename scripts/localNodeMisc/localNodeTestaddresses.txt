@@ -1,0 +1,14 @@
+
+🟢 FundFactoryUpgradeable deployed!
+
+   proxy address : 0x87833aFBb81bF8f936872132126b9c257ECd9F2C
+   impl  address : 0x5f30eB0677473e94cFfCadb93aaC4d09681618F6
+   owner         : 0x4387bf96c4da8Bd2d44981b276a8862B09BaE072
+
+🟢 InputFund deployed!
+
+    owner          : 0xC7FdEf69986317c1770d46C850560D9e469849Cf
+    proxy          : 0x353A1B3eDcB20F2D58BB9a95DF85f77C4EbB3F0C
+✅  implementation : 0xF06dA6f5256BB8A67CF2DB9b1fe1de321500EC94
+    fundType       : INPUT
+
